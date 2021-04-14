@@ -380,39 +380,49 @@ class HrTimesheetSheet(models.Model):
         self.generate_km_lines()
         return res
 
-    @job
-    def _recompute_timesheet(self):
-        """Recompute this sheet and its lines. This function is called
-        asynchronically after create/write"""
+    @job(default_channel='root.timesheet')
+    def _recompute_timesheet(self, fields):
+        """Recompute this sheet and its lines.
+        This function is called asynchronically after create/write"""
         for this in self:
-            this.modified(self._fields.keys())
+            this.modified(fields)
+            if 'timesheet_ids' not in fields:
+                continue
             this.mapped('timesheet_ids').modified(
                 self.env['account.analytic.line']._fields.keys()
             )
         self.recompute()
 
+    def _queue_recompute_timesheet(self, fields):
+        """Queue a recomputation if appropriate"""
+        if not fields or not self:
+            return
+        return self.with_delay(
+            identity_key=self._name + ',' + ','.join(map(str, self.ids)) +
+            ',' + ','.join(fields)
+        )._recompute_timesheet(fields)
+
     @api.model
     def create(self, vals):
-        with self.env.norecompute():
-            result = super(
-                HrTimesheetSheet, self.with_context(_timesheet_write=True)
-            ).create(vals)
-        result.with_delay()._recompute_timesheet()
+        result = super(
+            HrTimesheetSheet, self.with_context(_timesheet_write=True)
+        ).create(vals)
+        result._queue_recompute_timesheet(['timesheet_ids'])
         return result
 
     @api.one
     def write(self, vals):
-        with self.env.norecompute():
-            result = super(
-                HrTimesheetSheet, self.with_context(_timesheet_write=True)
-            ).write(vals)
-        self.with_delay()._recompute_timesheet()
+        result = super(
+            HrTimesheetSheet, self.with_context(_timesheet_write=True)
+        ).write(vals)
         self.env['account.analytic.line'].search([
             ('sheet_id', '=', self.id),
             '|',
             ('unit_amount', '>', 24),
             ('unit_amount', '<', 0),
         ]).write({'unit_amount': 0})
+        if 'timesheet_ids' in vals:
+            self._queue_recompute_timesheet(['timesheet_ids'])
         return result
 
     @api.multi
